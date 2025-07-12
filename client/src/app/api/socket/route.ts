@@ -1,9 +1,13 @@
 import { Server } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
-import { ChessGame } from '../../../lib/chessGame';
+import { ChessGame, GameConfig, GameState } from '../../../lib/chessGame';
 
 // Store active games in memory
 const games = new Map<string, ChessGame>();
+
+// Store completed games in memory
+const completedGames = new Map<string, GameState & { completedAt: number }>();
+
 const io = new Server({
   cors: {
     origin: "*",
@@ -12,15 +16,34 @@ const io = new Server({
 });
 
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
+  // Log connection with safe console usage
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('Client connected:', socket.id);
+  }
 
-  socket.on('createGame', () => {
+  // Handle creating a new game
+  socket.on('createGame', (config: GameConfig = {}) => {
     const gameId = uuidv4();
-    const game = new ChessGame(gameId);
+    const game = new ChessGame(gameId, config);
     games.set(gameId, game);
     
+    // Listen for game events
     game.on('moveCompleted', (state) => {
       io.to(gameId).emit('gameUpdate', state);
+      
+      // If game is over, store it in completed games
+      if (state.isGameOver) {
+        completedGames.set(gameId, {
+          ...state,
+          completedAt: Date.now()
+        });
+        games.delete(gameId);
+        game.cleanup();
+      }
+    });
+
+    game.on('chatMessage', (message) => {
+      io.to(gameId).emit('chatMessage', message);
     });
 
     game.on('gameReset', (state) => {
@@ -31,6 +54,7 @@ io.on('connection', (socket) => {
     socket.emit('gameCreated', { gameId, ...game.getState() });
   });
 
+  // Handle joining an existing game
   socket.on('joinGame', (gameId: string) => {
     const game = games.get(gameId);
     if (game) {
@@ -41,7 +65,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('makeMove', ({ gameId, from, to }) => {
+  // Handle making a move
+  socket.on('makeMove', async ({ gameId, from, to }) => {
     const game = games.get(gameId);
     if (!game) {
       socket.emit('error', 'Game not found');
@@ -53,9 +78,21 @@ io.on('connection', (socket) => {
       return;
     }
 
-    game.makeMove(from, to);
+    await game.makeMove(from, to);
   });
 
+  // Handle chat messages
+  socket.on('sendMessage', ({ gameId, username, message }) => {
+    const game = games.get(gameId);
+    if (!game) {
+      socket.emit('error', 'Game not found');
+      return;
+    }
+
+    game.addChatMessage(username, message);
+  });
+
+  // Handle getting possible moves for a square
   socket.on('getPossibleMoves', ({ gameId, square }) => {
     const game = games.get(gameId);
     if (!game) {
@@ -67,12 +104,27 @@ io.on('connection', (socket) => {
     socket.emit('possibleMoves', { square, moves: possibleMoves });
   });
 
+  // Handle getting game history
+  socket.on('getGameHistory', (gameId: string) => {
+    const completedGame = completedGames.get(gameId);
+    if (completedGame) {
+      socket.emit('gameHistory', completedGame);
+    } else {
+      socket.emit('error', 'Game history not found');
+    }
+  });
+
   socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('Client disconnected:', socket.id);
+    }
   });
 });
 
+// Start the Socket.IO server
 const port = process.env.SOCKET_PORT || 3001;
 io.listen(Number(port));
 
-console.log(`Socket.IO server running on port ${port}`); 
+if (process.env.NODE_ENV !== 'production') {
+  console.log(`Socket.IO server running on port ${port}`);
+} 
