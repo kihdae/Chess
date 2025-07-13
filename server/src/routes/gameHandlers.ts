@@ -1,213 +1,176 @@
 import { Server, Socket } from 'socket.io';
-import { Chess } from 'chess.js';
-import { db } from '../db';
-import { games, moves, players } from '../db/schema';
-import { eq, sql } from 'drizzle-orm';
+import { v4 as uuidv4 } from 'uuid';
+import { Chess, Move } from 'chess.js';
+import { ChessAI, AIDifficulty } from '../services/chessAI';
 
 interface GameState {
-  gameId: number;
-  chess: Chess;
-  players: {
-    white?: { id: number; username: string };
-    black?: { id: number; username: string };
-  };
-  spectators: string[];
-  moveNumber: number;
+  fen: string;
+  isGameOver: boolean;
+  isCheck: boolean;
+  turn: 'w' | 'b';
+  history: Move[];
+  lastMove?: Move;
 }
-const activeGames = new Map<number, GameState>();
 
-export const setupGameHandlers = (io: Server) => {
+interface Game {
+  id: string;
+  chess: Chess;
+  ai?: ChessAI;
+  isAIGame: boolean;
+  players: {
+    white?: string;
+    black?: string;
+  };
+}
+
+const games = new Map<string, Game>();
+
+export function initializeGameHandlers(io: Server) {
   io.on('connection', (socket: Socket) => {
     console.log('Client connected:', socket.id);
 
-    socket.on('joinGame', async ({ gameId, username, role }) => {
-      try {
-        const player = await db.query.players.findFirst({
-          where: eq(players.username, username)
-        });
-
-        if (!player) {
-          socket.emit('error', 'Player not found');
-          return;
+    socket.on('createGame', (config: { isAIGame: boolean, aiDifficulty?: AIDifficulty }) => {
+      const gameId = uuidv4();
+      const game: Game = {
+        id: gameId,
+        chess: new Chess(),
+        isAIGame: config.isAIGame,
+        players: {
+          white: socket.id
         }
+      };
 
-        const gameState = activeGames.get(gameId) || {
+      if (config.isAIGame) {
+        game.ai = new ChessAI();
+        if (config.aiDifficulty) {
+          game.ai.setDifficulty(config.aiDifficulty);
+        }
+        game.players.black = 'AI';
+      }
+
+      games.set(gameId, game);
+      socket.join(gameId);
+
+      const gameState = getGameState(game);
+      socket.emit('gameCreated', { gameId, ...gameState });
+    });
+
+    socket.on('joinGame', (gameId: string) => {
+      const game = games.get(gameId);
+      if (!game) {
+        socket.emit('error', 'Game not found');
+        return;
+      }
+
+      if (game.isAIGame) {
+        socket.emit('error', 'Cannot join AI game');
+        return;
+      }
+
+      if (!game.players.black) {
+        game.players.black = socket.id;
+        socket.join(gameId);
+        io.to(gameId).emit('playerJoined', { 
           gameId,
-          chess: new Chess(),
-          players: {
-            white: undefined,
-            black: undefined
-          },
-          spectators: [],
-          moveNumber: 0
-        };
-
-        if (role === 'spectator') {
-          gameState.spectators.push(socket.id as never);
-        } else if (!gameState.players[role as keyof typeof gameState.players]) {
-          gameState.players[role as keyof typeof gameState.players] = {
-            id: player.id,
-            username: player.username
-          };
-
-          if (!activeGames.has(gameId)) {
-            await db.insert(games).values({
-              id: gameId,
-              whitePlayerId: gameState.players.white?.id as number,
-              blackPlayerId: gameState.players.black?.id as number,
-              startTime: new Date(),
-              totalMoves: 0,
-              isAIGame: false
-            });
-          }
-        } else {
-          socket.emit('error', 'Role already taken');
-          return;
-        }
-
-        activeGames.set(gameId, gameState);
-        socket.join(gameId.toString());
-        
-        // Notify room of new player
-        io.to(gameId.toString()).emit('gameState', {
-          fen: gameState.chess.fen(),
-          players: {
-            white: gameState.players.white?.username as string,
-            black: gameState.players.black?.username as string
-          },
-          spectators: gameState.spectators.length
+          players: game.players,
+          ...getGameState(game)
         });
-      } catch (error) {
-        console.error('Error in joinGame:', error);
-        socket.emit('error', 'Internal server error');
+      } else {
+        socket.emit('error', 'Game is full');
       }
     });
 
-    socket.on('move', async ({ gameId, from, to, promotion }) => {
-      const gameState = activeGames.get(gameId);
-      if (!gameState) {
+    socket.on('makeMove', async ({ gameId, from, to }) => {
+      const game = games.get(gameId);
+      if (!game) {
+        socket.emit('error', 'Game not found');
+        return;
+      }
+
+      // Verify it's the player's turn
+      const playerColor = game.players.white === socket.id ? 'w' : 'b';
+      if (game.chess.turn() !== playerColor) {
+        socket.emit('error', 'Not your turn');
+        return;
+      }
+
+      try {
+        const move = game.chess.move({ from, to });
+        if (move) {
+          const gameState = getGameState(game);
+          io.to(gameId).emit('gameUpdate', gameState);
+
+          // If it's an AI game and it's AI's turn
+          if (game.isAIGame && game.ai && game.chess.turn() === 'b' && !game.chess.isGameOver()) {
+            try {
+              const aiFen = game.chess.fen();
+              const aiMove = await game.ai.getBestMove(aiFen);
+              const [aiFrom, aiTo] = aiMove.match(/.{1,2}/g) || [];
+              
+              if (aiFrom && aiTo) {
+                game.chess.move({ from: aiFrom, to: aiTo });
+                const aiGameState = getGameState(game);
+                io.to(gameId).emit('gameUpdate', aiGameState);
+              }
+            } catch (error) {
+              console.error('AI move error:', error);
+              socket.emit('error', 'AI move failed');
+            }
+          }
+        }
+      } catch (error) {
+        socket.emit('error', 'Invalid move');
+      }
+    });
+
+    socket.on('getPossibleMoves', ({ gameId, square }) => {
+      const game = games.get(gameId);
+      if (!game) {
         socket.emit('error', 'Game not found');
         return;
       }
 
       try {
-        const move = gameState.chess.move({ from, to, promotion });
-        if (move) {
-          gameState.moveNumber++;
-
-          // Save move to database
-          await db.insert(moves).values({
-            gameId: gameState.gameId,
-            playerId: gameState.players[gameState.chess.turn() === 'w' ? 'black' : 'white']?.id || null,
-            moveNumber: gameState.moveNumber,
-            move: move.san,
-            timeSpent: 0, 
-            fen: gameState.chess.fen(),
-            isCheck: gameState.chess.isCheck(),
-            isCapture: move.captured ? true : false
-          });
-
-          await db.update(games)
-            .set({ 
-              totalMoves: gameState.moveNumber,
-              finalFen: gameState.chess.fen()
-            })
-            .where(eq(games.id, gameId));
-
-          // If game is over, update final state
-          if (gameState.chess.isGameOver()) {
-            let result = '1/2-1/2'; // Default to draw
-            if (gameState.chess.isCheckmate()) {
-              // If it's checkmate, the player who just moved won
-              result = gameState.chess.turn() === 'w' ? '0-1' : '1-0';
-            }
-
-            await db.update(games)
-              .set({ 
-                endTime: new Date(),
-                result,
-                finalFen: gameState.chess.fen()
-              })
-              .where(eq(games.id, gameId));
-
-            if (result !== '1/2-1/2') {
-              const winner = result === '1-0' ? 'white' : 'black';
-              const loser = result === '1-0' ? 'black' : 'white';
-
-              if (gameState.players[winner]?.id) {
-                await db.update(players)
-                  .set({ 
-                    wins: sql`${players.wins} + 1`,
-                    totalGames: sql`${players.totalGames} + 1`
-                  })
-                  .where(eq(players.id, gameState.players[winner].id));
-              }
-
-              if (gameState.players[loser]?.id) {
-                await db.update(players)
-                  .set({ 
-                    losses: sql`${players.losses} + 1`,
-                    totalGames: sql`${players.totalGames} + 1`
-                  })
-                  .where(eq(players.id, gameState.players[loser].id));
-              }
-            } else {
-              // Update draw statistics for both players
-              for (const role of ['white', 'black']) {
-                if (gameState.players[role as keyof typeof gameState.players]?.id) {
-                  await db.update(players)
-                    .set({ 
-                      draws: sql`${players.draws} + 1`,
-                      totalGames: sql`${players.totalGames} + 1`
-                    })
-                    .where(eq(players.id, gameState.players[role as keyof typeof gameState.players]?.id as number));
-                }
-              }
-            }
-          }
-
-          // Broadcast new state
-          io.to(gameId.toString()).emit('gameState', {
-            fen: gameState.chess.fen(),
-            lastMove: move,
-            isGameOver: gameState.chess.isGameOver()
-          });
-        }
+        const moves = game.chess.moves({ 
+          square,
+          verbose: true 
+        });
+        socket.emit('possibleMoves', { square, moves });
       } catch (error) {
-        console.error('Error in move:', error);
-        socket.emit('error', 'Invalid move');
+        socket.emit('error', 'Invalid square');
       }
     });
 
-    // Handle chat messages
-    socket.on('chat', ({ gameId, username, message }) => {
-      io.to(gameId.toString()).emit('chat', { username, message });
-    });
-
-    // Handle disconnection
     socket.on('disconnect', () => {
-      // Remove player/spectator from active games
-      activeGames.forEach((state, gameId) => {
-        if (state.players.white?.username === socket.id) {
-          state.players.white = undefined;
-        }
-        if (state.players.black?.username === socket.id) {
-          state.players.black = undefined;
-        }
-        state.spectators = state.spectators.filter(id => id !== socket.id);
-        
-        if (!state.players.white && !state.players.black && !state.spectators.length) {
-          activeGames.delete(gameId);
-        } else {
-          io.to(gameId.toString()).emit('gameState', {
-            players: {
-              white: state.players.white?.username as string,
-              black: state.players.black?.username as string
-            },
-            spectators: state.spectators.length
+      console.log('Client disconnected:', socket.id);
+      // Handle game cleanup or forfeit if player disconnects
+      for (const [gameId, game] of games.entries()) {
+        if (game.players.white === socket.id || game.players.black === socket.id) {
+          io.to(gameId).emit('playerDisconnected', {
+            gameId,
+            playerId: socket.id
           });
+          
+          // If it's an AI game, clean up AI resources
+          if (game.isAIGame && game.ai) {
+            game.ai.cleanup();
+          }
+          
+          games.delete(gameId);
         }
-      });
+      }
     });
   });
-}; 
+}
+
+function getGameState(game: Game): GameState {
+  const history = game.chess.history({ verbose: true });
+  return {
+    fen: game.chess.fen(),
+    isGameOver: game.chess.isGameOver(),
+    isCheck: game.chess.isCheck(),
+    turn: game.chess.turn(),
+    history,
+    lastMove: history[history.length - 1]
+  };
+} 
