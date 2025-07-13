@@ -1,202 +1,115 @@
-import { Chess, Move, Square } from "chess.js";
-import { EventEmitter } from "events";
-import { ChessAI } from "./chessAI";
-import { GameAnalyticsService } from "../services/gameAnalytics";
+import { Chess, Move, Square } from 'chess.js';
+import { EventEmitter } from 'events';
+import { Socket } from 'socket.io-client';
+import { getSocket } from '../app/api/socket/route';
 
 export interface GameState {
   fen: string;
   isGameOver: boolean;
   isCheck: boolean;
-  turn: "w" | "b";
+  turn: 'w' | 'b';
   history: Move[];
   lastMove?: Move;
-  chat: ChatMessage[];
-  analytics?: {
-    averageMoveTime: number;
-    totalCaptures: number;
-    openingName: string;
-    materialAdvantage: Record<string, number>;
-    checks: number;
-  };
-}
-
-export interface ChatMessage {
-  username: string;
-  message: string;
-  timestamp: number;
 }
 
 export interface GameConfig {
   isAIGame?: boolean;
-  aiDifficulty?: "easy" | "medium" | "hard";
+  aiDifficulty?: 'easy' | 'medium' | 'hard';
 }
 
 export class ChessGame extends EventEmitter {
   private game: Chess;
-  private gameId: string;
-  private ai?: ChessAI;
-  private chat: ChatMessage[] = [];
+  private gameId?: string;
+  private socket: Socket;
   private isAIGame: boolean;
-  private analyticsService: GameAnalyticsService;
-  private moveStartTime: number = 0;
-  private dbGameId?: number;
-  private whitePlayerId?: number;
-  private blackPlayerId?: number;
 
-  constructor(gameId: string, config: GameConfig = {}) {
+  constructor(config: GameConfig = {}) {
     super();
     this.game = new Chess();
-    this.gameId = gameId;
+    this.socket = getSocket();
     this.isAIGame = config.isAIGame || false;
-    this.analyticsService = new GameAnalyticsService();
 
-    if (this.isAIGame) {
-      this.ai = new ChessAI();
-      if (config.aiDifficulty) {
-        this.ai.setDifficulty(config.aiDifficulty);
-      }
+    this.setupSocketListeners();
+  }
+
+  private setupSocketListeners() {
+    this.socket.on('gameCreated', (data: { gameId: string } & GameState) => {
+      this.gameId = data.gameId;
+      this.game.load(data.fen);
+      this.emit('gameCreated', data);
+    });
+
+    this.socket.on('gameUpdate', (state: GameState) => {
+      this.game.load(state.fen);
+      this.emit('gameUpdate', state);
+    });
+
+    this.socket.on('playerJoined', (data: { gameId: string, players: any } & GameState) => {
+      this.game.load(data.fen);
+      this.emit('playerJoined', data);
+    });
+
+    this.socket.on('playerDisconnected', (data: { gameId: string, playerId: string }) => {
+      this.emit('playerDisconnected', data);
+    });
+
+    this.socket.on('possibleMoves', (data: { square: Square, moves: Move[] }) => {
+      this.emit('possibleMoves', data);
+    });
+
+    this.socket.on('error', (error: string) => {
+      this.emit('error', error);
+    });
+  }
+
+  public createGame() {
+    this.socket.emit('createGame', {
+      isAIGame: this.isAIGame
+    });
+  }
+
+  public joinGame(gameId: string) {
+    this.socket.emit('joinGame', gameId);
+  }
+
+  public makeMove(from: Square, to: Square) {
+    if (!this.gameId) {
+      this.emit('error', 'No active game');
+      return;
     }
 
-    // Start move timer
-    this.moveStartTime = Date.now();
+    this.socket.emit('makeMove', {
+      gameId: this.gameId,
+      from,
+      to
+    });
   }
 
-  public async initializeGame(whitePlayerId: number, blackPlayerId: number) {
-    this.whitePlayerId = whitePlayerId;
-    this.blackPlayerId = blackPlayerId;
-    // Initialize game in database and get the ID
-    // This will be implemented in database service
-  }
-
-  public getGameId(): string {
-    return this.gameId;
-  }
-
-  public async getState(): Promise<GameState> {
-    const history = this.game.history({ verbose: true });
-    let analytics;
-
-    if (this.dbGameId) {
-      try {
-        analytics = await this.analyticsService.getGameAnalytics(this.dbGameId);
-      } catch (error) {
-        console.error("Failed to fetch analytics:", error);
-      }
+  public getPossibleMoves(square: Square) {
+    if (!this.gameId) {
+      this.emit('error', 'No active game');
+      return;
     }
 
+    this.socket.emit('getPossibleMoves', {
+      gameId: this.gameId,
+      square
+    });
+  }
+
+  public getState(): GameState {
     return {
       fen: this.game.fen(),
       isGameOver: this.game.isGameOver(),
       isCheck: this.game.isCheck(),
       turn: this.game.turn(),
-      history,
-      lastMove: history[history.length - 1],
-      chat: this.chat,
-      analytics,
+      history: this.game.history({ verbose: true }),
+      lastMove: this.game.history({ verbose: true }).pop()
     };
   }
 
-  public async makeMove(from: string, to: string): Promise<boolean> {
-    try {
-      const move = this.game.move({ from, to });
-      if (move) {
-        const timeSpent = Date.now() - this.moveStartTime;
-        this.moveStartTime = Date.now();
-
-        // Update analytics if we have database IDs
-        if (this.dbGameId && (this.whitePlayerId || this.blackPlayerId)) {
-          const currentPlayerId =
-            this.game.turn() === "w" ? this.blackPlayerId : this.whitePlayerId;
-          if (currentPlayerId) {
-            await this.analyticsService.analyzeMoveAndUpdateStats(
-              this.dbGameId,
-              currentPlayerId,
-              Math.floor(this.game.moveNumber() / 2),
-              `${from}${to}`,
-              timeSpent,
-              this.game.fen(),
-              this.game.fen()
-            );
-          }
-        }
-
-        this.emit("moveCompleted", await this.getState());
-
-        if (
-          this.isAIGame &&
-          this.ai &&
-          this.game.turn() === "b" &&
-          !this.game.isGameOver()
-        ) {
-          await this.makeAIMove();
-        }
-
-        return true;
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
-
-  private async makeAIMove(): Promise<boolean> {
-    if (!this.ai) return false;
-
-    try {
-      const bestMove = await this.ai.getBestMove(this.game.fen());
-      const from = bestMove.slice(0, 2);
-      const to = bestMove.slice(2, 4);
-
-      const move = this.game.move({ from, to });
-      if (move) {
-        this.emit("moveCompleted", this.getState());
-        return true;
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
-
-  public isValidMove(from: string, to: string): boolean {
-    try {
-      const moves = this.game.moves({ verbose: true });
-      return moves.some((move) => move.from === from && move.to === to);
-    } catch {
-      return false;
-    }
-  }
-
-  public getPossibleMoves(square: string): string[] {
-    try {
-      const moves = this.game.moves({
-        square: square as Square,
-        verbose: true,
-      });
-      return moves.map((move) => move.to);
-    } catch {
-      return [];
-    }
-  }
-
-  public addChatMessage(username: string, message: string): void {
-    const chatMessage = {
-      username,
-      message,
-      timestamp: Date.now(),
-    };
-    this.chat.push(chatMessage);
-    this.emit("chatMessage", chatMessage);
-  }
-
-  public resetGame(): void {
-    this.game.reset();
-    this.emit("gameReset", this.getState());
-  }
-
-  public cleanup(): void {
-    if (this.ai) {
-      this.ai.cleanup();
-    }
+  public cleanup() {
+    this.socket.off();
+    this.removeAllListeners();
   }
 }
